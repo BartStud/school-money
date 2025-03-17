@@ -1,0 +1,364 @@
+services:
+  traefik:
+    image: traefik:v2.9
+    container_name: traefik
+    depends_on:
+      - sm_chat
+      - sm_frontend
+      - sm_user
+      - sm_class
+      - sm_log
+    command:
+      - "--api.insecure=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--log.level=DEBUG"
+
+    ports:
+      - "3000:80"
+      - "8080:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - sm_net
+
+  keycloak:
+    image: "quay.io/keycloak/keycloak:latest"
+    container_name: keycloak
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      KEYCLOAK_LOGLEVEL: INFO
+    ports:
+      - "8082:8080"
+    command:
+      - start-dev
+    volumes:
+      - keycloak_data:/opt/keycloak/data
+      # TODO
+      # - ./paw_connect.json:/tmp/paw_connect.json
+      # - ./kc-theme:/opt/keycloak/themes/paw-theme
+    networks:
+      - sm_net
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.6.0
+    container_name: elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - xpack.security.enrollment.enabled=false
+      - ELASTICSEARCH_USERNAME=elastic
+      - ELASTICSEARCH_PASSWORD=changeme
+    ports:
+      - "9200:9200"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    networks:
+      - sm_net
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.6.0
+    container_name: kibana
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    ports:
+      - "5601:5601"
+    depends_on:
+      - elasticsearch
+    networks:
+      - sm_net
+
+  redis:
+    image: "redis:latest"
+    container_name: redis_chat
+    ports:
+      - "6379:6379"
+    networks:
+      - sm_net
+
+  minio:
+    image: minio/minio
+    container_name: minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minio_access_key
+      MINIO_ROOT_PASSWORD: minio_secret_key
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+    networks:
+        - sm_net
+
+  sm_frontend:
+    image: sm_frontend:latest
+    container_name: sm_frontend
+    ports:
+      - "3005:80"
+    volumes:
+      - ../sm-frontend:/app
+      - node_modules:/app/node_modules
+    environment:
+      ENV_VAR_REACT_APP_CHAT_SERVICE_URL: http://localhost:3000
+      ENV_VAR_KEYCLOAK_URL: http://localhost:8082/realms/paw_connect  # TODO: change realm name
+      ENV_VAR_KEYCLOAK_CLIENT_ID: web-app # TODO: change client id
+      CHOKIDAR_USEPOLLING: true
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.web_app.rule=Host(`localhost`)"
+      - "traefik.http.routers.web_app.entrypoints=web"
+      - "traefik.http.routers.web_app.priority=3"
+
+    networks:
+      - sm_net
+
+  sm_chat:
+    image: sm_chat:latest
+    volumes:
+      - ../sm-chat:/app
+    container_name: sm_chat
+    ports:
+      - "8002:8000"
+    depends_on:
+      - redis
+      - sm_chat_db
+      - elasticsearch
+      - keycloak
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://user:password@sm_chat_db:5432/chat_db
+      - REDIS_HOST=redis
+      - REDIS_URL=redis://redis:6379/0
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
+      - KEYCLOAK_SERVER_URL=http://keycloak:8080
+      # - KEYCLOAK_REALM=paw_connect  # TODO: change realm name
+      # - KEYCLOAK_ADMIN_CLIENT_SECRET=gt1mPvzJ3MVkyfs4RfaH6pJx8z1hpbKJ # TODO
+      # - KEYCLOAK_CLIENT_ID=chat-service # TODO
+      # - KEYCLOAK_CLIENT_SECRET=0T6BYixnHhjEdiv8vnMMKJDiiIqM5IJu # TODO
+      - KEYCLOAK_CALLBACK_URI=http://localhost:3000/
+      - PYTHONUNBUFFERED=1
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.chat_service.rule=PathPrefix(`/ws/chat`)"
+      - "traefik.http.routers.chat_service.entrypoints=web"
+      - "traefik.http.routers.chat_api.rule=PathPrefix(`/api/chat`)"
+      - "traefik.http.routers.chat_api.entrypoints=web"
+      - "traefik.http.routers.chat_service.priority=5"
+      - "traefik.http.routers.chat_api.priority=5"
+    networks:
+      - sm_net
+    command:
+      - "sh"
+      - "-c"
+      - "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+
+  sm_chat_db:
+    image: "postgres:latest"
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: sm_chat_db
+    volumes:
+      - postgres_data_sm_chat_db:/var/lib/postgresql/data
+    networks:
+      - sm_net
+
+  # sm_user:
+  #   image: sm_user:latest
+  #   volumes:
+  #     - ../sm-user:/app
+  #   container_name: sm_user
+  #   ports:
+  #     - "8003:8000"
+  #   depends_on:
+  #     - sm_user_db
+  #     - elasticsearch
+  #     - keycloak
+  #   environment:
+  #     - DATABASE_URL=postgresql+asyncpg://user:password@sm_user_db:5432/sm_user_db
+  #     - ELASTICSEARCH_URL=http://elasticsearch:9200
+  #     - KEYCLOAK_SERVER_URL=http://keycloak:8080
+  #     - KEYCLOAK_REALM=paw_connect  # TODO
+  #     - KEYCLOAK_ADMIN_CLIENT_SECRET=wSVxDu1FL5SIbdDlqEpr9wohnB8bxYO7 #TODO
+  #     - KEYCLOAK_CLIENT_ID=chat-service #TODO
+  #     - KEYCLOAK_CLIENT_SECRET=0T6BYixnHhjEdiv8vnMMKJDiiIqM5IJu #TODO
+  #     - KEYCLOAK_CALLBACK_URI=http://localhost:3000/
+  #     - KEYCLOAK_CLIIENT_PUBLIC_KEY=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAx3V7fKMuAO055R158iL18lehMdjFOZr1P7tmvrbQK3v/9hgbB6ROhOAmT1Aj+ml7rNMb+eMeJEPvDuE5sQm9hMUAU88bWC/pqWyCIegEEWEixeItUrBZLxEsmWagF5wFc90juNxu0qXEf2r/oKuRSdWuJXRx4IRkZm24XzlTLI/z7DZUvRL3t4e/XpnLgb8dVRw/xSmrqAFnbXbRaESDpp77KhTKlhxkVBiT5rBKRwAwI3a7kEYEFtvX3wpRimGPOh/uogtbHn1wKPmFLfpcchu6eIozvWTcVPkfPPSqOwS7HyYlHUdMS+MSjKlmM9dBCh81kgxRWbXLkz0vf6dQ3QIDAQAB #TODO
+  #     - PYTHONUNBUFFERED=1
+  #     - MINIO_HOST=minio:9000
+  #     - MINIO_ACCESS_KEY=minio_access_key
+  #     - MINIO_SECRET_KEY=minio_secret_key
+  #     - MINIO_BUCKET=user-media
+  #   labels:
+  #     - "traefik.enable=true"
+  #     - "traefik.http.routers.user_api.rule=PathPrefix(`/api/users`)"
+  #     - "traefik.http.routers.user_api.entrypoints=web"
+  #     - "traefik.http.routers.user_api.priority=5"
+  #   networks:
+  #     - sm_net
+  #   command:
+  #     - "sh"
+  #     - "-c"
+  #     - "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+
+  # sm_user_db:
+  #   image: "postgres:latest"
+  #   environment:
+  #     POSTGRES_USER: user
+  #     POSTGRES_PASSWORD: password
+  #     POSTGRES_DB: sm_user_db
+  #   volumes:
+  #     - postgres_data_sm_user_db:/var/lib/postgresql/data
+  #   networks:
+  #     - sm_net
+
+  # sm_class:
+  #   image: sm_class:latest
+  #   volumes:
+  #     - ../sm-class:/app
+  #   container_name: sm_class
+  #   ports:
+  #     - "8004:8000"
+  #   depends_on:
+  #     - sm_class_db
+  #     - keycloak
+  #   environment:
+  #     - DATABASE_URL=postgresql+asyncpg://user:password@sm_class_db:5432/sm_class_db
+  #     - KEYCLOAK_SERVER_URL=http://keycloak:8080
+  #     - KEYCLOAK_REALM=paw_connect # TODO
+  #     - KEYCLOAK_ADMIN_CLIENT_SECRET=wSVxDu1FL5SIbdDlqEpr9wohnB8bxYO7 # TODO
+  #     - KEYCLOAK_CLIENT_ID=chat-service # TODO
+  #     - KEYCLOAK_CLIENT_SECRET=0T6BYixnHhjEdiv8vnMMKJDiiIqM5IJu # TODO
+  #     - KEYCLOAK_CALLBACK_URI=http://localhost:3000/
+  #     - KEYCLOAK_CLIIENT_PUBLIC_KEY=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAx3V7fKMuAO055R158iL18lehMdjFOZr1P7tmvrbQK3v/9hgbB6ROhOAmT1Aj+ml7rNMb+eMeJEPvDuE5sQm9hMUAU88bWC/pqWyCIegEEWEixeItUrBZLxEsmWagF5wFc90juNxu0qXEf2r/oKuRSdWuJXRx4IRkZm24XzlTLI/z7DZUvRL3t4e/XpnLgb8dVRw/xSmrqAFnbXbRaESDpp77KhTKlhxkVBiT5rBKRwAwI3a7kEYEFtvX3wpRimGPOh/uogtbHn1wKPmFLfpcchu6eIozvWTcVPkfPPSqOwS7HyYlHUdMS+MSjKlmM9dBCh81kgxRWbXLkz0vf6dQ3QIDAQAB # TODO
+  #     - PYTHONUNBUFFERED=1
+  #     - MINIO_HOST=minio:9000
+  #     - MINIO_ACCESS_KEY=minio_access_key
+  #     - MINIO_SECRET_KEY=minio_secret_key
+  #     - MINIO_BUCKET=class-media # TODO
+  #   labels:
+  #     - "traefik.enable=true"
+  #     - "traefik.http.routers.class_api.rule=PathPrefix(`/api/class`)"
+  #     - "traefik.http.routers.class_api.entrypoints=web"
+  #     - "traefik.http.routers.class_api.priority=5"
+  #   networks:
+  #     - sm_net
+  #   command:
+  #     - "sh"
+  #     - "-c"
+  #     - "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+
+  # sm_class_db:
+  #   image: "postgres:latest"
+  #   environment:
+  #     POSTGRES_USER: user
+  #     POSTGRES_PASSWORD: password
+  #     POSTGRES_DB: sm_class_db
+  #   volumes:
+  #     - postgres_data_sm_class_db:/var/lib/postgresql/data
+  #   networks:
+  #     - sm_net
+
+  # sm_log:
+  #   image: sm_log:latest
+  #   volumes:
+  #     - ../sm-log:/app
+  #   container_name: sm_log
+  #   ports:
+  #     - "8005:8000"
+  #   depends_on:
+  #     - sm_log_db
+  #     - keycloak
+  #   environment:
+  #     - DATABASE_URL=postgresql+asyncpg://user:password@sm_log_db:5432/sm_log_db
+  #     - KEYCLOAK_SERVER_URL=http://keycloak:8080
+  #     - KEYCLOAK_REALM=paw_connect # TODO
+  #     - KEYCLOAK_ADMIN_CLIENT_SECRET=wSVxDu1FL5SIbdDlqEpr9wohnB8bxYO7 # TODO
+  #     - KEYCLOAK_CLIENT_ID=chat-service # TODO
+  #     - KEYCLOAK_CLIENT_SECRET=0T6BYixnHhjEdiv8vnMMKJDiiIqM5IJu # TODO
+  #     - KEYCLOAK_CALLBACK_URI=http://localhost:3000/
+  #     - KEYCLOAK_CLIIENT_PUBLIC_KEY=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAx3V7fKMuAO055R158iL18lehMdjFOZr1P7tmvrbQK3v/9hgbB6ROhOAmT1Aj+ml7rNMb+eMeJEPvDuE5sQm9hMUAU88bWC/pqWyCIegEEWEixeItUrBZLxEsmWagF5wFc90juNxu0qXEf2r/oKuRSdWuJXRx4IRkZm24XzlTLI/z7DZUvRL3t4e/XpnLgb8dVRw/xSmrqAFnbXbRaESDpp77KhTKlhxkVBiT5rBKRwAwI3a7kEYEFtvX3wpRimGPOh/uogtbHn1wKPmFLfpcchu6eIozvWTcVPkfPPSqOwS7HyYlHUdMS+MSjKlmM9dBCh81kgxRWbXLkz0vf6dQ3QIDAQAB # TODO
+  #     - PYTHONUNBUFFERED=1
+  #   labels:
+  #     - "traefik.enable=true"
+  #     - "traefik.http.routers.log_api.rule=PathPrefix(`/api/log`)"
+  #     - "traefik.http.routers.log_api.entrypoints=web"
+  #     - "traefik.http.routers.log_api.priority=5"
+  #   networks:
+  #     - sm_net
+  #   command:
+  #     - "sh"
+  #     - "-c"
+  #     - "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+
+  # sm_log_db:
+  #   image: "postgres:latest"
+  #   environment:
+  #     POSTGRES_USER: user
+  #     POSTGRES_PASSWORD: password
+  #     POSTGRES_DB: sm_log_db
+  #   volumes:
+  #     - postgres_data_sm_log_db:/var/lib/postgresql/data
+  #   networks:
+  #     - sm_net
+
+  # sm_billing:
+  #   image: sm_billing:latest
+  #   volumes:
+  #     - ../sm-billing:/app
+  #   container_name: sm_billing
+  #   ports:
+  #     - "8005:8000"
+  #   depends_on:
+  #     - sm_billing_db
+  #     - keycloak
+  #   environment:
+  #     - DATABASE_URL=postgresql+asyncpg://user:password@sm_billing_db:5432/sm_billing_db
+  #     - KEYCLOAK_SERVER_URL=http://keycloak:8080
+  #     - KEYCLOAK_REALM=paw_connect # TODO
+  #     - KEYCLOAK_ADMIN_CLIENT_SECRET=wSVxDu1FL5SIbdDlqEpr9wohnB8bxYO7 # TODO
+  #     - KEYCLOAK_CLIENT_ID=chat-service # TODO
+  #     - KEYCLOAK_CLIENT_SECRET=0T6BYixnHhjEdiv8vnMMKJDiiIqM5IJu # TODO
+  #     - KEYCLOAK_CALLBACK_URI=http://localhost:3000/
+  #     - KEYCLOAK_CLIIENT_PUBLIC_KEY=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAx3V7fKMuAO055R158iL18lehMdjFOZr1P7tmvrbQK3v/9hgbB6ROhOAmT1Aj+ml7rNMb+eMeJEPvDuE5sQm9hMUAU88bWC/pqWyCIegEEWEixeItUrBZLxEsmWagF5wFc90juNxu0qXEf2r/oKuRSdWuJXRx4IRkZm24XzlTLI/z7DZUvRL3t4e/XpnLgb8dVRw/xSmrqAFnbXbRaESDpp77KhTKlhxkVBiT5rBKRwAwI3a7kEYEFtvX3wpRimGPOh/uogtbHn1wKPmFLfpcchu6eIozvWTcVPkfPPSqOwS7HyYlHUdMS+MSjKlmM9dBCh81kgxRWbXLkz0vf6dQ3QIDAQAB # TODO
+  #     - PYTHONUNBUFFERED=1
+  #   labels:
+  #     - "traefik.enable=true"
+  #     - "traefik.http.routers.billing_api.rule=PathPrefix(`/api/billing`)"
+  #     - "traefik.http.routers.billing_api.entrypoints=web"
+  #     - "traefik.http.routers.billing_api.priority=5"
+  #   networks:
+  #     - sm_net
+  #   command:
+  #     - "sh"
+  #     - "-c"
+  #     - "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+
+  # sm_billing_db:
+  #   image: "postgres:latest"
+  #   environment:
+  #     POSTGRES_USER: user
+  #     POSTGRES_PASSWORD: password
+  #     POSTGRES_DB: sm_billing_db
+  #   volumes:
+  #     - postgres_data_sm_billing_db:/var/lib/postgresql/data
+  #   networks:
+  #     - sm_net
+
+
+networks:
+  sm_net:
+    driver: bridge
+
+volumes:
+  keycloak_data:
+  elasticsearch_data:
+  postgres_data_sm_chat_db:
+  postgres_data_sm_user_db:
+  postgres_data_sm_class_db:
+  postgres_data_sm_log_db:
+  postgres_data_sm_billing_db:
+  node_modules:
+  minio-data:
